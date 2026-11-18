@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>perf-flow</title>
+    <link rel="stylesheet" href="/style.css" />
+    <!-- 无构建步骤:用 import map 把裸模块名指向 vendor/ 下的单文件 -->
+    <script type="importmap">
+      { "imports": { "preact": "/vendor/preact.mjs", "preact/hooks": "/vendor/hooks.mjs", "htm": "/vendor/htm.mjs" } }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>

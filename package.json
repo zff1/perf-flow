@@ -1,0 +1,39 @@
+{
+  "name": "perf-flow",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Measure web page loading (TTFB, FCP, LCP, custom milestones) with a local web UI.",
+  "license": "MIT",
+  "author": "yizheng",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zff1/perf-flow.git"
+  },
+  "homepage": "https://github.com/zff1/perf-flow#readme",
+  "bugs": {
+    "url": "https://github.com/zff1/perf-flow/issues"
+  },
+  "keywords": [
+    "performance",
+    "web-vitals",
+    "lcp",
+    "fcp",
+    "ttfb",
+    "playwright",
+    "chrome"
+  ],
+  "type": "module",
+  "bin": {
+    "perf-flow": "bin/perf-flow.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node bin/perf-flow.js",
+    "demo": "node examples/demo-server.js"
+  },
+  "dependencies": {
+    "playwright-core": "^1.65.0"
+  }
+}
