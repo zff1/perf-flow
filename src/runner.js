@@ -2,6 +2,8 @@ import { EventEmitter } from 'node:events'
 import { launchBrowser, measureRound } from './measure.js'
 import { deriveRound, summarize, pickFrames } from './summarize.js'
 import { newId, saveRun } from './store.js'
+import { attachProbe } from './attach.js'
+import { buildServerData } from './server-trace.js'
 
 export const VERSION = '0.1.0'
 
@@ -57,6 +59,7 @@ export function normalizeConfig(raw) {
     settleMs: int(raw.settleMs, 3000, 0, 30000, '加载后等待'),
     timeoutMs: int(raw.timeoutMs, 30000, 5000, 120000, '超时'),
     annotate: raw.annotate !== false,
+    serverProbe: !!raw.serverProbe, // 附加到本机 Node 服务,记录服务端明细
     detectors,
   }
 }
@@ -99,12 +102,50 @@ export class Run extends EventEmitter {
         await ctx.close()
       } catch {}
 
+      // 服务端探针(可选)。连不上不会让测量失败:照常测,并在结果里如实写明为什么没有服务端数据
+      let probe = null
+      let probeState = { state: 'off' }
+      if (cfg.serverProbe) {
+        this.push({ type: 'status', message: '正在连接本机服务进程…' })
+        try {
+          probe = await attachProbe(cfg.url)
+          this.probe = probe
+          probeState = { state: 'ok', pid: probe.pid, node: probe.node }
+          this.push({ type: 'status', message: `已连接服务进程 pid ${probe.pid}(Node ${probe.node})` })
+        } catch (e) {
+          probeState = { state: 'failed', message: String((e && e.message) || e) }
+          this.push({ type: 'status', message: '服务端分析不可用:' + probeState.message })
+        }
+      }
+
       const rounds = []
       for (let i = 1; i <= cfg.rounds; i++) {
         if (this.signal.cancelled) throw new Error('已取消')
         this.push({ type: 'progress', phase: 'round', index: i, total: cfg.rounds })
+        let pstate = probeState
+        if (probe && pstate.state === 'ok') {
+          try {
+            await probe.reset()
+          } catch (e) {
+            pstate = { state: 'failed', message: String((e && e.message) || e) }
+            probeState = pstate
+          }
+        }
         const r = await measureRound({ browser: this.browser, cfg, annotate: false, signal: this.signal })
         if (this.signal.cancelled) throw new Error('已取消')
+        if (r.ok) {
+          let traces = null
+          if (probe && pstate.state === 'ok') {
+            try {
+              traces = await probe.take()
+            } catch (e) {
+              pstate = { state: 'failed', message: String((e && e.message) || e) }
+              probeState = pstate
+            }
+          }
+          const server = buildServerData({ data: r.data, probe: pstate, traces })
+          if (server) r.data.server = server
+        }
         const entry = { index: i, ok: r.ok, error: r.error, data: r.data, derived: r.ok ? deriveRound(r.data) : null }
         rounds.push(entry)
         this.push({ type: 'round', index: i, ok: r.ok, error: r.error })
@@ -149,7 +190,7 @@ export class Run extends EventEmitter {
       }
 
       const result = {
-        schemaVersion: 2, // 2:新增资源列表、script 属性、DCL / load 的开始与结束时刻
+        schemaVersion: 4, // 4:新增脚本执行(data.scriptRuns);3:新增服务端明细(data.server);2:新增资源列表、script 属性、DCL / load 的开始与结束时刻
         id: this.id,
         tool: { name: 'perf-flow', version: VERSION },
         startedAt: this.startedAt,
@@ -166,6 +207,8 @@ export class Run extends EventEmitter {
       this.push({ type: 'error', message: String((e && e.message) || e) })
     } finally {
       this.finished = true
+      // 无论成功、失败还是取消,都要把探针从被测进程里撤掉,并关闭我们打开的调试端口
+      if (this.probe) await this.probe.detach().catch(() => {})
       if (this.browser) await this.browser.close().catch(() => {})
       this.emit('end')
     }

@@ -17,7 +17,7 @@ export function installProbe(cfg) {
   try {
     performance.setResourceTimingBufferSize(2000)
   } catch (e) {}
-  const pf = (window.__pf = { fp: null, fcp: null, lcp: [], det: {} })
+  const pf = (window.__pf = { fp: null, fcp: null, lcp: [], det: {}, runs: [], loafSupported: false })
   const now = () => performance.now()
   const r1 = (n) => Math.round(n * 10) / 10
   const raf = (fn) => requestAnimationFrame(fn)
@@ -135,6 +135,31 @@ export function installProbe(cfg) {
         if (e.name === 'first-contentful-paint') pf.fcp = r1(e.startTime)
       }
     }).observe({ type: 'paint', buffered: true })
+  } catch (e) {}
+
+  // ---------- 脚本执行(长动画帧) ----------
+  // Resource Timing 只到下载完成,脚本下载之后的"执行"没有记录。Chrome 123+ 的 Long Animation Frames
+  // 会报告长于 50 ms 的帧里、每个执行 ≥5 ms 的脚本(来源、起点、耗时)。更短的帧和脚本看不到。
+  try {
+    pf.loafSupported = (PerformanceObserver.supportedEntryTypes || []).indexOf('long-animation-frame') >= 0
+    if (pf.loafSupported) {
+      new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) {
+          for (const s of e.scripts || []) {
+            if (pf.runs.length >= 300) return
+            pf.runs.push({
+              src: String(s.sourceURL || '').slice(0, 300),
+              type: s.invokerType || '',
+              invoker: String(s.invoker || '').slice(0, 80),
+              fn: String(s.sourceFunctionName || '').slice(0, 60),
+              start: r1(s.executionStart),
+              dur: r1(s.duration),
+              forced: r1(s.forcedStyleAndLayoutDuration || 0),
+            })
+          }
+        }
+      }).observe({ type: 'long-animation-frame', buffered: true })
+    }
   } catch (e) {}
 
   // ---------- LCP 候选 ----------
@@ -330,6 +355,9 @@ export function collectPage() {
     fp: pf ? pf.fp : null,
     fcp: pf ? pf.fcp : null,
     lcp: pf ? pf.lcp : [],
+    // 长动画帧里记录到的脚本执行(只含 ≥5 ms、且所在帧 >50 ms 的);不支持时 loafSupported 为 false
+    scriptRuns: pf ? pf.runs : [],
+    loafSupported: !!(pf && pf.loafSupported),
     detectors: dets,
     nav: nav
       ? {
@@ -358,6 +386,10 @@ export function collectPage() {
           decodedBodySize: nav.decodedBodySize,
         }
       : null,
+    // 服务端通过 Server-Timing 响应头上报的阶段(只有名称和时长,没有起点)。服务端没输出这个头时为空
+    serverTiming: nav && nav.serverTiming
+      ? Array.from(nav.serverTiming).slice(0, 30).map((s) => ({ name: String(s.name).slice(0, 60), desc: String(s.description || '').slice(0, 120), dur: r1(s.duration) }))
+      : [],
     // 完整的资源列表(用来归因 DCL / load);最多保存 400 条
     resources: res.slice(0, 400).map((r) => ({
       name: r.name.length > 300 ? r.name.slice(0, 300) : r.name,

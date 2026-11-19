@@ -1,12 +1,48 @@
 import { html, useState, useRef, useMemo } from '../lib/h.js'
 import { fmt, isNum, CIRCLED, lastSel, fileName, fmtInt } from '../lib/format.js'
 import { EXPLAIN, describeDetector, precisionOf } from '../lib/text.js'
-import { buildTimelineRows, layoutTimeline, timelineMax, niceStep, COLORS, UNEXPLAINED_TEXT, LEGEND } from '../lib/model.js'
+import { buildTimelineRows, layoutTimeline, timelineMax, niceStep, COLORS, UNEXPLAINED_TEXT, unexplainedNote, RUN_TYPE, legendFor, FOCUS_HINT, SRV_GAP } from '../lib/model.js'
 import { tip, TipCard, TipRows, TipText, RoundBars } from './Tooltip.js'
 import { explainDclLoad, KIND_LABEL, baseName } from '../lib/loadphases.js'
 
 const INIT_LABEL = { link: '样式表', script: '脚本', css: '样式', img: '图片', fetch: 'fetch', xmlhttprequest: 'XHR' }
 const METRIC_OF = { redirect: 'redirect', dns: 'dns', connect: 'connect', wait: 'serverWait', html: 'htmlDownload' }
+
+/**
+ * "等待服务器响应"悬浮卡片里追加的服务端信息,并把这段时间拆开对账:
+ *   等待 = 调用实际占用的时间(并行的只算一次) + 服务端自己 / 无法识别 + 网络往返
+ */
+function srvRows({ q, probe }, aggregate) {
+  const winStart = q.offset
+  const winEnd = q.offset + q.firstByteAt
+  const iv = q.spans.filter((sp) => isNum(sp.start) && isNum(sp.end)).map((sp) => [Math.max(sp.start, winStart), Math.min(sp.end, winEnd)]).filter(([a, b]) => b > a).sort((a, b) => a[0] - b[0])
+  let covered = 0
+  let cur = null
+  for (const [a, b] of iv) {
+    if (!cur || a > cur[1]) {
+      if (cur) covered += cur[1] - cur[0]
+      cur = [a, b]
+    } else cur[1] = Math.max(cur[1], b)
+  }
+  if (cur) covered += cur[1] - cur[0]
+  const sum = q.spans.reduce((m, sp) => (isNum(sp.start) && isNum(sp.end) ? m + (sp.end - sp.start) : m), 0)
+  const rest = Math.max(0, q.firstByteAt - covered)
+  return [
+    ['上游调用实际占用', fmt(covered) + (sum - covered > 5 ? `(各调用时长直接相加是 ${fmt(sum)},并行的部分重叠了)` : '')],
+    ['服务端自己 / 无法识别', fmt(rest)],
+    isNum(q.slack) ? ['网络往返(估算)', fmt(Math.max(0, q.slack))] : null,
+    isNum(q.total) && q.total - q.firstByteAt > 5 ? ['响应写完', `${fmt(q.total)}(第一个字节之后还在继续写出)`] : null,
+    q.status ? ['HTTP 状态', String(q.status)] : null,
+    isNum(q.n) && isNum(q.of) ? ['匹配到页面请求', `${q.n} / ${q.of} 轮`] : null,
+    probe && probe.pid ? ['被测进程', `pid ${probe.pid} · ${probe.node || ''}`] : null,
+  ]
+}
+
+/** 同一个资源在好几个时间点的路径里都有角色时,悬浮卡片里把另外几个角色列出来 */
+const alsoNode = (row) =>
+  row.also && row.also.length
+    ? html`<${TipText}><b>它同时是:</b>${row.also.map((a) => html`<div>· ${a}</div>`)}<//>`
+    : null
 
 /** 生成某一行的悬浮提示内容 */
 function rowTip(row, ctx) {
@@ -18,8 +54,18 @@ function rowTip(row, ctx) {
     const dur = row.end - row.start
     const m = summary.metrics[METRIC_OF[row.tip]]
     return html`<${TipCard} title=${row.label} color=${row.color} sub=${fmt(dur)}>
-      <${TipRows} rows=${[['起止', `${fmt(row.start)} → ${fmt(row.end)}`], row.tip === 'wait' ? ['TTFB(首字节)', fmt(row.end)] : null]} />
+      <${TipRows} rows=${[
+        ['起止', `${fmt(row.start)} → ${fmt(row.end)}`],
+        row.tip === 'wait' ? ['TTFB(首字节)', fmt(row.end)] : null,
+        ...(row.tip === 'wait' && row.data && row.data.q ? srvRows(row.data, !!round.aggregate) : []),
+      ]} />
       <${TipText}>${EXPLAIN[row.tip]}<//>
+      ${row.tip === 'wait' && row.data && row.data.q
+        ? html`<${TipText}>${round.aggregate
+            ? html`<span class="cov">⚠ 这是汇总:每一项都是各轮分别取的${ctx.stat === 'mean' ? '平均值' : '中位数'},中位数不能相加,所以这几项加起来可能和等待时间有出入。要核对“加起来是否等于”,请选某一轮(单轮里:上游调用实际占用 + 服务端自己 / 无法识别 + 网络往返 = 等待时间)。</span>`
+            : html`<span class="hint2">这一轮里:上游调用实际占用 + 服务端自己 / 无法识别 + 网络往返 = 等待时间。</span>`}<//>
+          <${TipText}><span class="hint2">服务端记录来自注入在服务进程里的探针。对齐是估算:服务端和浏览器的时钟不是同一个,假设网络的去程和回程各占一半,本机访问时误差通常在几毫秒内。</span><//>`
+        : null}
       ${m && m.values.length > 1 ? html`<${RoundBars} values=${m.values} median=${m.median} />` : null}
     <//>`
   }
@@ -35,6 +81,7 @@ function rowTip(row, ctx) {
         isNum(late) && late >= 0 ? ['FCP 比它晚', fmt(late)] : null,
       ]} />
       <${TipText}>${EXPLAIN.block}<//>
+      ${alsoNode(row)}
       <${TipText}><span class="hint2">来源:Chrome 在 Resource Timing 里给这个请求打的“渲染阻塞”标记。</span><//>
     <//>`
   }
@@ -107,14 +154,85 @@ function rowTip(row, ctx) {
       ]} />
       ${det && remain > 150 ? html`<${TipText}><span class="cov">⚠ 它下载完之后还有 ${fmt(remain)} 无法识别原因(脚本执行、解析等,没有记录)。</span><//>` : null}
       <${TipText}>${why}<//>
+      ${alsoNode(row)}
     <//>`
   }
   if (row.tip === 'unknown') {
-    const { from, to } = row.data
+    const { from, to, loaf } = row.data
     return html`<${TipCard} title="无法识别" color=${row.color} sub=${fmt(to - from)}>
       <${TipRows} rows=${[['起止', `${fmt(from)} → ${fmt(to)}`]]} />
       <${TipText}>${UNEXPLAINED_TEXT}<//>
-      <${TipText}><span class="hint2">要识别它,需要 Chrome 的性能 trace(能看到主线程每个任务和脚本的执行耗时),目前没有记录。</span><//>
+      <${TipText}><span class="hint2">${unexplainedNote(loaf)}</span><//>
+    <//>`
+  }
+  if (row.tip === 'scriptrun') {
+    const { run, clipped } = row.data
+    const name = run.src ? fileName(run.src) : run.invoker || '脚本'
+    const pg = round.data.url
+    const inline = run.src && pg && run.src.split(/[?#]/)[0] === pg.split(/[?#]/)[0]
+    const fcp = round.data.fcp
+    return html`<${TipCard} title=${inline ? '页面内联脚本' : name} color=${row.color} sub=${fmt(run.dur)}>
+      <${TipRows} rows=${[
+        run.src ? ['来源', run.src, true] : null,
+        ['类型', RUN_TYPE[run.type] || run.type],
+        run.invoker ? ['触发者', run.invoker, true] : null,
+        run.fn ? ['函数', run.fn, true] : null,
+        ['执行', `${fmt(run.start)} → ${fmt(run.start + run.dur)}(耗时 ${fmt(run.dur)})`],
+        run.forced > 1 ? ['其中强制样式 / 布局', fmt(run.forced)] : null,
+        isNum(run.n) ? ['出现在', `${run.n} 轮`] : null,
+        isNum(fcp) && run.start < fcp ? ['FCP 比它执行完晚', fmt(fcp - (run.start + run.dur))] : null,
+      ]} />
+      ${clipped ? html`<${TipText}><span class="hint2">图上只画出了落在这段空白里的部分。</span><//>` : null}
+      <${TipText}>脚本执行时占着主线程,这期间浏览器画不出页面;同步脚本还会让后面的 HTML 解析也停下。它在 Resource Timing 里没有记录,下载完成之后的这一段以前只能标成“无法识别”。<//>
+      <${TipText}><span class="hint2">来源:Chrome 的长动画帧(Long Animation Frames)接口,只记录所在帧长于 50 ms、自身执行不少于 5 ms 的脚本,更短的看不到。脚本在页面第一次绘制之前执行时,Chrome 不一定会报告(实测有时整个漏掉),所以没有这条记录并不代表没有执行。</span><//>
+    <//>`
+  }
+  if (row.tip === 'lcpimg') {
+    const { res, c } = row.data
+    return html`<${TipCard} title=${fileName(res.name)} color=${row.color} sub=${fmt(res.end - res.start)}>
+      <${TipRows} rows=${[
+        ['地址', res.name, true],
+        ['下载', `${fmt(res.start)} → ${fmt(res.end)}`],
+        res.size ? ['传输大小', `${(res.size / 1024).toFixed(1)} KB`] : null,
+        ['LCP 时间', fmt(c.t)],
+        isNum(c.t) ? ['下载完成之后又过了', fmt(c.t - res.end)] : null,
+      ]} />
+      <${TipText}>最终的 LCP 元素就是这张图片,它下载完成之前不可能被绘制出来,所以这个请求直接决定了 LCP。<//>
+      <${TipText}><span class="hint2">下载完成到真正绘制之间(解码、布局,以及它之前被什么挡住),没有任何记录,界面里会单独标成“无法识别”。</span><//>
+      ${alsoNode(row)}
+    <//>`
+  }
+  if (row.tip === 'srvcall') {
+    const { sp, det, chain, winEnd } = row.data
+    const after = winEnd - sp.end
+    return html`<${TipCard} title=${`${sp.method} ${sp.target.slice(sp.target.indexOf('/'))}`} color=${row.color} sub=${fmt(sp.end - sp.start)}>
+      <${TipRows} rows=${[
+        ['目标', sp.target, true],
+        ['方式', sp.via === 'fetch' ? '原生 fetch' : 'http / https 模块'],
+        ['起止', `${fmt(sp.start)} → ${fmt(sp.end)}`],
+        sp.status ? ['状态', String(sp.status)] : null,
+        sp.error ? ['错误', sp.error] : null,
+        sp.open ? ['说明', '服务端写出响应时这个调用还没结束'] : null,
+        isNum(sp.n) ? ['出现在', `${sp.n} 轮`] : null,
+        det ? ['作用', '这是响应写出之前最后完成的上游调用(决定者)'] : chain ? ['作用', '它先完成,下一个调用才发出(串行),所以也在关键路径上'] : null,
+      ]} />
+      ${det && after > SRV_GAP ? html`<${TipText}><span class="cov">⚠ 它结束之后又过了 ${fmt(after)} 才写出第一个字节,这段时间探针无法识别(服务端自己的处理、数据库等)。</span><//>` : null}
+      <${TipText}>服务端在处理这次页面请求时发出的出站调用。几个调用的时间重叠,说明是并行;首尾相接,说明是串行。<//>
+    <//>`
+  }
+  if (row.tip === 'srvunk') {
+    const { from, to, where } = row.data
+    return html`<${TipCard} title="无法识别" color=${row.color} sub=${fmt(to - from)}>
+      <${TipRows} rows=${[['位置', where], ['起止', `${fmt(from)} → ${fmt(to)}`]]} />
+      <${TipText}>这段时间里服务端没有发出任何 http / https / fetch 调用,探针看不到它在做什么。可能是服务端自己的同步计算(渲染、序列化)、数据库或 Redis 等探针不覆盖的调用,也可能是事件循环被其他请求占着。<//>
+      <${TipText}><span class="hint2">要进一步确定,需要对服务进程做 CPU 采样,目前没有。</span><//>
+    <//>`
+  }
+  if (row.tip === 'srvtiming') {
+    const t = row.data
+    return html`<${TipCard} title=${t.name} color=${row.color} sub=${fmt(t.dur)}>
+      <${TipRows} rows=${[['说明', t.desc], isNum(t.n) ? ['出现在', `${t.n} 轮`] : null]} />
+      <${TipText}>服务端通过 Server-Timing 响应头自己上报的阶段耗时。这个头只有名称和时长,没有起止时刻,所以不能画在时间轴上。<//>
     <//>`
   }
   if (row.tip === 'pending') {
@@ -165,21 +283,16 @@ function rowTip(row, ctx) {
 }
 
 export function Timeline({ result, round, onPick, scope, stat }) {
-  const [hoverT, setHoverT] = useState(null)
-  const [expanded, setExpanded] = useState(() => new Set()) // 总览里已展开的链
-  const [focusSel, setFocus] = useState('all') // 聚焦到哪条链
+  const [focusSel, setFocus] = useState('all') // 聚焦到哪个时间点
   const overlayRef = useRef(null)
-  const toggleGroup = (name) => {
-    const next = new Set(expanded)
-    next.has(name) ? next.delete(name) : next.add(name)
-    setExpanded(next)
-  }
+  const crossRef = useRef(null) // 十字线
+  const bubbleRef = useRef(null) // 轴上的时间气泡
 
   const rows = useMemo(() => (round ? buildTimelineRows(round, result.summary, result.config) : []), [round, result])
   if (!round) return null
   const d = round.data
   const n = d.nav
-  const layout = layoutTimeline(rows, focusSel, expanded)
+  const layout = layoutTimeline(rows, focusSel)
   const focus = layout.focus
   const T = timelineMax(layout.axisRows)
   const pct = (t) => `${Math.min(100, Math.max(0, (t / T) * 100))}%`
@@ -187,12 +300,27 @@ export function Timeline({ result, round, onPick, scope, stat }) {
   const ticks = []
   for (let t = 0; t <= T; t += step) ticks.push(t)
 
+  // 鼠标在图上移动:只更新十字线和时间气泡(直接改 DOM,不重渲染整张时间线,也不去高亮任何行)
+  const showCross = (frac) => {
+    const c = crossRef.current
+    const b = bubbleRef.current
+    if (!c || !b) return
+    if (frac == null) {
+      c.classList.remove('on')
+      b.classList.remove('on')
+      return
+    }
+    c.style.left = b.style.left = `${frac * 100}%`
+    b.textContent = fmt(frac * T)
+    c.classList.add('on')
+    b.classList.add('on')
+  }
   const onMove = (e) => {
     const el = overlayRef.current
     if (!el) return
     const r = el.getBoundingClientRect()
     const x = e.clientX - r.left
-    setHoverT(x >= 0 && x <= r.width ? (x / r.width) * T : null)
+    showCross(x >= 0 && x <= r.width ? x / r.width : null)
   }
 
   // 首字节 → FCP 区域
@@ -210,49 +338,32 @@ export function Timeline({ result, round, onPick, scope, stat }) {
       : d.blockingSupported === false
         ? html`<div>无法识别渲染阻塞资源:当前 Chrome 不提供这项信息。</div>`
         : null
-  const ctx = { round, summary: result.summary, ex: explainDclLoad(round) }
+  const ctx = { round, summary: result.summary, ex: explainDclLoad(round), stat }
 
-  // 树形连线:绝对定位在行的左侧,每层一格 14px;子项在上、父行在下,竖线从第一个子项一直连到父行
-  //   'v' 竖线穿过,'f' ┌,'t' ├,'p' 接到这一行自己的子项;标签左边按层级(depth)留出缩进
-  const IND = 14
-  const treeCells = (tree) => (tree && tree.length ? html`<span class="tr-wrap">${tree.map((k) => html`<i class=${'tr ' + k}></i>`)}</span>` : null)
+  // 缩进:只有服务端发出的上游调用缩进一级(它们是“等待服务器响应”里面的事)
+  const IND = 16
   const indent = (depth, base) => `padding-left:${base + (depth || 0) * IND}px`
 
-  // 按链渲染:平铺的链(请求与服务器、你的检测)有标题;树形的链以父行当标题,子行缩进并画连线
-  const body = []
-  layout.chains.forEach((ch) => {
-    const out = []
-    if (ch.flat) out.push(html`<div class="wf-group" key=${'g' + ch.id}><span>${ch.title}</span></div>`)
-    ch.items.forEach((it) => out.push(it.more ? renderMore(it) : renderRow(it.row, it.tree, it.depth)))
-    body.push(html`<div class=${'wf-chain' + (ch.flat ? '' : ' tree')} key=${'c' + ch.id}>${out}</div>`)
-  })
+  // 不分组:所有行按时间顺序排成一列
+  const body = layout.items.map((it) => renderRow(it.row, it.depth))
 
-  function renderMore(it) {
-    return html`<div class="wf-row wf-morerow" key=${'more' + it.chain}>
-      ${treeCells(it.tree)}
-      <div class="wf-label" style=${indent(it.depth, 4)}><div class="wf-name"><button class="wf-more" onClick=${() => toggleGroup(it.chain)}>${it.open ? '收起 ▴' : `展开其余 ${it.hidden} 项 ▾`}</button></div></div>
-    </div>`
-  }
-
-  function renderRow(row, tree, depth) {
+  function renderRow(row, depth) {
     // 说明行(没有名字的 note):整行通栏显示,不画色点和空的标签列
     if (row.kind === 'note' && !row.label) {
       return html`<div class=${'wf-row k-note wf-full' + (row.warn ? ' wf-warnrow' : '')} key=${row.key} style=${indent(depth, 15)}>
-        ${treeCells(tree)}<div class="wf-fulltext">${row.warn ? '⚠ ' : ''}${row.text}</div>
+        <div class="wf-fulltext">${row.warn ? '⚠ ' : ''}${row.text}</div>
       </div>`
     }
     const content = rowTip(row, ctx)
-    const active = row.kind === 'bar' && hoverT != null && hoverT >= row.start && hoverT <= row.end
     const clickable = !!row.link
-    const cls = `wf-row k-${row.kind} ${active ? 'active' : ''} ${clickable ? 'click' : ''} ${row.sub ? 'hassub' : ''}`
+    const cls = `wf-row k-${row.kind} ${clickable ? 'click' : ''}`
     const tipProps = tip(content)
 
     // 左侧名称
-    const label = html`<div class="wf-label" style=${indent(depth, 4)}>
-      ${treeCells(tree)}
+    const label = html`<div class=${'wf-label' + (depth ? ' sub' : '')} style=${indent(depth, 4)}>
       <div class="wf-name">
         <i class="dot" style=${`background:${row.color || '#ccc'}`}></i>
-        ${row.fileUrl ? html`<span class="mono">${fileName(row.fileUrl)}</span>${row.badge ? html`<em class=${'badge ' + (row.badgeCls || '')}>${row.badge}</em>` : null}` : html`<span class=${row.strong ? 'strong' : ''}>${isNum(row.num) ? CIRCLED[row.num] + ' ' : ''}${row.label}</span>`}
+        ${row.fileUrl && row.tip === 'scriptrun' ? html`<em class=${'badge ' + (row.badgeCls || '')}>${row.badge}</em><span class="mono">${fileName(row.fileUrl)}</span>` : row.fileUrl ? html`<span class="mono">${fileName(row.fileUrl)}</span>${row.badge ? html`<em class=${'badge ' + (row.badgeCls || '')}>${row.badge}</em>` : null}` : html`<span class=${row.strong ? 'strong' : ''}>${isNum(row.num) ? CIRCLED[row.num] + ' ' : ''}${row.label}</span>${row.badge ? html`<em class=${'badge ' + (row.badgeCls || '')}>${row.badge}</em>` : null}`}
         ${row.covered ? html`<em class="badge warnb" title="被其他元素盖住">被遮挡</em>` : null}
       </div>
       ${row.sub ? html`<div class="wf-sub mono" title=${row.sub}>${row.sub.startsWith('TTFB') ? row.sub : lastSel(row.sub)}</div>` : null}
@@ -290,16 +401,16 @@ export function Timeline({ result, round, onPick, scope, stat }) {
       </span>
       <span class="seg tl-focus" id="tl-focus" title="聚焦:只看某一个时间点是由什么决定的">
         <button class=${focus === 'all' ? 'on' : ''} onClick=${() => setFocus('all')}>总览</button>
-        ${layout.available.map((c) => html`<button key=${c.id} class=${focus === c.id ? 'on' : ''} onClick=${() => setFocus(c.id)}>${c.focus}</button>`)}
+        ${layout.available.map((c) => html`<button key=${c.id} class=${focus === c.id ? 'on' : ''} onClick=${() => setFocus(c.id)}>${c.label}</button>`)}
       </span>
     </div>
-    <div class="tl-legend">${focus === 'all' ? LEGEND : `聚焦:只显示“请求与服务器”和“${layout.available.find((c) => c.id === focus).focus}”,并展开全部明细。`}</div>
+    <div class="tl-legend" id="tl-legend">${focus === 'all' ? legendFor(layout.hiddenUnknown) : FOCUS_HINT[focus]}</div>
 
-    <div class="wf" onMouseMove=${onMove} onMouseLeave=${() => setHoverT(null)}>
+    <div class="wf" onMouseMove=${onMove} onMouseLeave=${() => showCross(null)}>
       <div class="wf-overlay" ref=${overlayRef}>
         ${ticks.map((t) => html`<i class="wf-grid" style=${`left:${pct(t)}`}></i>`)}
         ${band ? html`<div class="wf-band" style=${`left:${pct(band.a)};width:${((band.b - band.a) / T) * 100}%`}></div>` : null}
-        ${hoverT != null ? html`<div class="wf-cross" style=${`left:${pct(hoverT)}`}></div>` : null}
+        <div class="wf-cross" ref=${crossRef}></div>
       </div>
 
       <div class="wf-axis">
@@ -307,7 +418,7 @@ export function Timeline({ result, round, onPick, scope, stat }) {
         <div class="wf-axis-chart">
           ${ticks.map((t) => html`<span style=${`left:${pct(t)}`}>${t === 0 ? '0' : t >= 1000 ? t / 1000 + ' s' : t + ' ms'}</span>`)}
           ${band ? html`<div class=${'wf-bandlabel' + (bandWide ? '' : ' out')} style=${`left:${pct(band.a)};width:${((band.b - band.a) / T) * 100}%`} title="首字节到首次绘制之间"><b>首字节 → FCP ${fmt(band.b - band.a)}</b></div>` : null}
-          ${hoverT != null ? html`<div class="wf-bubble" style=${`left:${pct(hoverT)}`}>${fmt(hoverT)}</div>` : null}
+          <div class="wf-bubble" ref=${bubbleRef}></div>
         </div>
       </div>
 

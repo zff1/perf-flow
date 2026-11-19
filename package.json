@@ -31,9 +31,11 @@
   },
   "scripts": {
     "start": "node bin/perf-flow.js",
-    "demo": "node examples/demo-server.js"
+    "demo": "node examples/demo-server.js",
+    "demo:server": "node examples/upstream-demo.cjs"
   },
   "dependencies": {
-    "playwright-core": "^1.65.0"
+    "playwright-core": "^1.65.0",
+    "ws": "^8.23.0"
   }
 }

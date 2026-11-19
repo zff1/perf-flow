@@ -13,6 +13,7 @@ export const DEFAULT_CFG = () => ({
   timeoutSec: 30,
   headless: false,
   annotate: true,
+  serverProbe: false,
   detectors: [emptyDetector()],
 })
 
@@ -30,6 +31,7 @@ export function toRequest(cfg) {
     timeoutMs: Number(cfg.timeoutSec) * 1000,
     headless: !!cfg.headless,
     annotate: !!cfg.annotate,
+    serverProbe: !!cfg.serverProbe,
     detectors: cfg.detectors.map((d) => ({ label: d.label.trim(), type: d.type, value: d.value.trim(), state: d.state, when: d.when })),
   }
 }
@@ -45,6 +47,7 @@ export function fromResultConfig(c) {
     timeoutSec: Math.round((c.timeoutMs || 30000) / 1000),
     headless: !!c.headless,
     annotate: c.annotate !== false,
+    serverProbe: !!c.serverProbe,
     detectors: dets.length ? dets : [emptyDetector()],
   }
 }
@@ -86,6 +89,7 @@ function FormBar({ cfg, running, onEdit, onRun, onCancel, error }) {
         <span>${cfg.headless ? '无头' : '有窗口'}</span>
         <span>${n} 项检测</span>
         ${cfg.annotate ? html`<span>画面标注</span>` : null}
+        ${cfg.serverProbe ? html`<span>服务端分析</span>` : null}
       </div>
     </div>
     <div class="fb-actions">
@@ -128,7 +132,14 @@ export function Form({ cfg, setCfg, running, onRun, onCancel, error, flashUid, o
       <label>超时 <input id="timeout" type="number" min="5" max="120" value=${cfg.timeoutSec} onInput=${(e) => set({ timeoutSec: e.target.value })} /> s</label>
       <label class="check"><input id="headless" type="checkbox" checked=${cfg.headless} onChange=${(e) => set({ headless: e.target.checked })} /> 无头模式(不弹窗口)</label>
       <label class="check"><input id="annotate" type="checkbox" checked=${cfg.annotate} onChange=${(e) => set({ annotate: e.target.checked })} /> 生成画面标注(多跑 1 轮)</label>
+      <label class="check" title="只支持本机上运行的 Node 服务"><input id="serverProbe" type="checkbox" checked=${cfg.serverProbe} onChange=${(e) => set({ serverProbe: e.target.checked })} /> 分析服务端(本机 Node 服务)</label>
     </div>
+    ${cfg.serverProbe
+      ? html`<div class="sp-hint" id="sp-hint">
+          测量时会向监听该端口的 Node 进程发送 <span class="mono">SIGUSR1</span>,让它临时打开调试端口(127.0.0.1:9229),并注入一段只读探针,记录页面请求在服务端的耗时和它发出的上游调用(<span class="mono">http</span> / <span class="mono">https</span> / <span class="mono">fetch</span>)。
+          测完立即卸载探针并关闭调试端口。<b>不改你的代码,不需要重启服务。</b>只对本机、同一用户的 Node 进程生效;数据库、Redis 等看不到。
+        </div>`
+      : null}
 
     <div class="detectors">
       <div class="dhead">

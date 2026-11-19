@@ -98,6 +98,10 @@ function App() {
     } catch (e) {
       return setError(e.message)
     }
+    // 界面是每次现读的,后端却是启动时加载的:升级后没有重启,后端就会悄悄丢掉它不认识的选项
+    if (toRequest(cfg).serverProbe && !started.config.serverProbe) {
+      setError('“分析服务端”没有生效:正在运行的 perf-flow 后端还是旧版本,不认识这个选项。请在启动它的终端里按 Ctrl+C 停掉,重新启动后再测一次。这次只有浏览器端的数据。')
+    }
     const total = started.config.rounds + (started.config.annotate ? 1 : 0)
     let done = 0
     setFormOpen(false)
